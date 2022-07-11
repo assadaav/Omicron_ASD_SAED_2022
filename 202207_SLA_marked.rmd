@@ -1,0 +1,771 @@
+---
+title: "202207_saed_covid_asd"
+author: "tai"
+date: '2022-07-05'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+rm(list = ls())
+
+library(tidyverse)
+library(rms)
+library(MASS)
+library(lme4)
+library(ggpubr)
+library(ggsci)
+```
+
+# init
+- read data
+```{r}
+df <- readxl::read_xls("base_P_C (to RT)_r2.xls")
+df_cbcl <- readxl::read_xls(
+  "CBCL_rev.xls"
+)
+source("get_model_stat_202205.r")
+```
+
+- handle CBCL
+```{r}
+df_cbcl_temp <- df_cbcl %>%
+  dplyr::select(id, sex, CBCL_4_5_F:CBCL_6_11_M_ex) %>%
+  pivot_longer(
+    cols = CBCL_4_5_F:CBCL_6_11_M_ex, names_to = "colname",values_to = "value" 
+  )
+df_cbcl_temp <- df_cbcl_temp %>%
+  mutate(
+    agegroup = gsub("[a-zA-Z_]*","",gsub("CBCL_","",x = colname)),
+    type = gsub("_bl","",gsub("[0-9A-Z]_*","",x = colname))
+  ) 
+
+# Chinses normal model in the literature; ref: Su1996
+Su1996_mod <- data.frame(
+  type = c(
+    rep(c("withd", "deps", "soma", "agres",
+    "in", "ex"), 8)
+  ),
+  sex = c(
+    rep(0,12), rep(1,12),
+    rep(0,12), rep(1,12)
+  ),
+  agegroup = rep(
+    rep(c(rep("45",6), rep("611",6)),4)
+  ),
+  cbcl_mean = c(
+    1.02, 3.45, 1.00, 6.34, 7.31, 8.21, #M, 4-5
+    1.08, 1.68, 1.01, 4.55, 6.06, 8.74, #M, 6-11
+    1.68, 1.60, 3.59, 4.97, 7.82, 8.17, #F, 4-5
+    1.85, 2.46, 1.69, 4.86, 5.26, 8.20 #F, 6-11
+  ),
+  cbcl_sd = c(
+    1.31, 3.16, 1.23, 4.07, 5.76, 5.49, #M, 4-5
+    1.19, 2.12, 1.63, 4.10, 5.74, 6.80,  #M, 6-11
+    1.79, 2.26, 2.74, 4.02, 6.46, 5.74, #F, 4-5
+    1.95, 2.57, 2.25, 4.19, 5.23, 6.55 #F, 6-11
+  ),
+  stringsAsFactors = F
+)
+
+df_cbcl_temp <- df_cbcl_temp %>%
+  left_join(Su1996_mod, by = c("type", "sex", "agegroup"))
+df_cbcl_temp <- df_cbcl_temp %>%
+  distinct(id, sex, colname, .keep_all = T) %>%
+  filter(!is.na(cbcl_mean), !is.na(value))
+df_cbcl_temp <- df_cbcl_temp %>%
+  mutate(z_hnmod = (value-cbcl_mean)/cbcl_sd)
+df_cbcl_temp <- df_cbcl_temp %>%
+  mutate(r3 = stringr::str_sub(colname, -3,-1),
+         bl = case_when(r3=="_bl"~"_bl", TRUE~""),
+         type_cat = paste0("Z_HN_",type, bl))
+
+df_cbcl_syn <- df_cbcl_temp %>%
+  dplyr::select(id,type_cat,z_hnmod) %>%
+  pivot_wider(id_cols = "id", names_from = type_cat, values_from = z_hnmod)
+
+df <- left_join(df, df_cbcl_syn, by = "id")
+
+```
+
+- handle covid-related stress
+```{r}
+df <- df %>%
+  mutate(Stress_total= Stress_1+Stress_2+Stress_3+Stress_4+Stress_5+Stress_6+Stress_7)
+df$Stress_total <- as.numeric(df$Stress_total)
+
+df <- df %>%
+  mutate(Lock_infection_3cat = case_when(
+    infect6==1 & Lock_2 == 0 ~ "0_open_lowrisk",
+    infect6==1 & Lock_2 == 1 ~ "1_lock_lowrisk",
+    infect6==0 & Lock_2 == 1 ~ "2_lock_highrisk"
+  ),Lock_infection_3cat = factor(Lock_infection_3cat)
+  )
+
+```
+
+- exposure: lockdown
+```{r}
+df <- df %>%
+  mutate(Lock_days_cat = case_when(
+    Lock_2==0 ~ "0_No_Lock",
+    Lock_2==1 & Day_lock_2 <35 ~ "1_<35days",
+    Lock_2==1 & Day_lock_2 >=35 ~ "2_>=35days"
+  ),
+  Lock_days_cat = factor(Lock_days_cat),
+  Lock_2 = factor(Lock_2)
+  )
+```
+
+- define variables
+```{r}
+EXPOSURE_VAR <- c(
+  "Lock_2", # 2-cat
+  "Lock_days_cat" # 3-cat
+)
+
+FACTOR_VAR <- c(
+  "Lock_2", "Lock_days_cat",
+  "school_influ",
+  "behav_influ3", 
+  "med_influ2",
+  "other_influ2",
+  "sex", 
+  "Educa_2",
+  "Mari_2",
+  "Income_2",
+  "infect6",
+  colnames(df)[startsWith(colnames(df),"Stress_")],
+  "Fami_cohes_cat", 
+  "Fami_adapt_cat"
+)
+
+COVARS <- c(
+  "sex", "age",
+  "Educa_2",
+  "Income_2"
+)
+
+COVARS_FIT <- c( # no transformation
+  "sex", "age",
+  "Educa_2",
+  "Income_2"
+)
+
+OUTCOME_VAR_FOLLOWUP <- c(
+  "srs_aware", "srs_cog", "srs_com", "srs_motiv", "srs_mann",
+  "srs_tot",
+  "sdq_emo", "sdq_beh", "sdq_hyper", "sdq_peer", "sdq_tot",
+  "sdq_prosocial", 
+  "sleep_habit", "sleep_anx", "sleep_inreg" , "sleep_osa", 
+  "sleep_disturb", "sleep_daysleep",   "sleep_awake", 
+  "sleep_latency", "sleep_tot",
+  "Z_HN_soma",     "Z_HN_deps",     "Z_HN_withd",  
+  "Z_HN_agres",    "Z_HN_in",       "Z_HN_ex"
+)
+
+OUTCOME_VAR_BASELINE <- c(
+  paste0(OUTCOME_VAR_FOLLOWUP, "_bl")
+)
+
+OUTCOME_VAR_2 <- c(
+  "cgi_i", "cgi_s"
+)
+
+MEDIATION_VAR1 <- c(
+  colnames(df)[startsWith(colnames(df),"Stress_")], 
+  "Stress_total",
+  "school_3cat","behav_3cat",
+  "med_3cat",
+  "infect6"
+)
+
+MEDIATION_VAR2 <- c(
+  "Sleep_TS", 
+  paste0("Sleep_",LETTERS[1:7])
+  
+)
+
+MODIFIER_VAR <- c(
+  "Fami_cohes", "Fami_adapt",
+  "Emo_A",
+  "Emo_B",
+  "Resil_TS",
+  paste0("BFI_",LETTERS[1:5]),
+  "infect6"
+)
+
+CONTINUOUS_VARS <- setdiff(union(EXPOSURE_VAR, MODIFIER_VAR), FACTOR_VAR)
+
+```
+
+```{r}
+to_factor <- function(data, var){
+  data[[var]][is.na(data[[var]])] <- 99
+  data[[var]] <- as.factor(data[[var]])
+  return(data)
+}
+
+for (i in FACTOR_VAR){
+  df <- to_factor(df, i)
+}
+
+df$age <- df$age_month/12
+df_dataframe <- data.frame(df)
+
+df <- df %>%
+  mutate(
+    school_baseline = case_when(
+      school34==0 ~ 1,
+      TRUE ~ 0
+    ),
+    behav_baseline = case_when(
+      behav_influ1==1 ~ 1,
+      TRUE ~ 0
+    ),
+    med_baseline = case_when(
+      med_influ1==1 ~ 1,
+      TRUE ~ 0
+    ),
+    school_cov = case_when(
+      school_baseline==1 & school_influ==1 ~ 1,
+      TRUE ~ 0
+    ),
+    behav_cov = case_when(
+      behav_baseline==1 & school_influ==1 ~ 1,
+      TRUE ~ 0
+    ),
+    med_cov = case_when(
+      school_cov==1 & school_influ==1 ~ 1,
+      TRUE ~ 0
+    ),
+    school_3cat = case_when(
+      school_baseline==0 ~ "0_not_attending",
+      school_baseline==1 & school_cov==0 ~ "1_uninfluenced",
+      school_baseline==1 & school_cov==1 ~ "2_influenced"
+    ),
+    behav_3cat = case_when(
+      behav_baseline==0 ~ "0_not_attending",
+      behav_baseline==1 & behav_cov==0 ~ "1_uninfluenced",
+      behav_baseline==1 & behav_cov==1 ~ "2_influenced"
+    ),
+    med_3cat = case_when(
+      med_baseline==0 ~ "0_not_attending",
+      med_baseline==1 & med_cov==0 ~ "1_uninfluenced",
+      med_baseline==1 & med_cov==1 ~ "2_influenced"
+    ), school_3cat= factor(school_3cat), behav_3cat=factor(behav_3cat), med_3cat=factor(med_3cat)
+  )
+
+dd <- datadist(df)
+options(datadist = dd)
+```
+```{r}
+df_mixed_1 <- df %>%
+  dplyr::select(id, COVARS, EXPOSURE_VAR, MEDIATION_VAR1, MEDIATION_VAR2, 
+         MODIFIER_VAR, OUTCOME_VAR_BASELINE)
+colnames(df_mixed_1) <- gsub("_bl","",colnames(df_mixed_1))
+
+df_mixed_2 <- df %>%
+  dplyr::select(id, COVARS, EXPOSURE_VAR, MEDIATION_VAR1, MEDIATION_VAR2, 
+         MODIFIER_VAR, OUTCOME_VAR_FOLLOWUP)
+
+df_mixed <- bind_rows(df_mixed_1, df_mixed_2,.id = "timepoint")
+df_mixed$timepoint <- factor(as.numeric(df_mixed$timepoint)-1)
+
+```
+
+# analysis
+- table 1
+```{r}
+table1::table1(as.formula(paste0(
+  "~",paste0(c(COVARS, 
+               "infect6", "school_3cat","behav_3cat", "med_3cat",
+               paste0("BFI_",LETTERS[1:5])),collapse = "+"),"|",
+  "Lock_days_cat"
+)),
+df)
+```
+
+- CGI: figure 1a
+```{r}
+ggplot(df)+
+  geom_bar(aes(Lock_days_cat, fill = factor(cgi_i)), position = position_fill(reverse = T))+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 45, hjust = .8))+
+ xlab("")+
+  ylab("Proportion")+
+ ggsci::scale_fill_aaas(name = "CGI_I")+
+  scale_x_discrete(labels = c("No lockdown", "Short-term lockdown", "Long-term lockdown"))
+```
+
+```{r}
+print(
+  df %>%
+    group_by(Lock_days_cat) %>%
+    summarise(mean_cgi_i = mean(cgi_i),
+              sd_cgi_i = sd(cgi_i))
+)
+```
+
+- CGI-I ~ Lockdown (2-cat)
+```{r}
+f_cgi_i_lockdays_crude <- lm(as.formula(
+        paste0(
+          "cgi_i", "~",
+          "Lock_2"
+          )
+        ),
+      df)
+print(summary(f_cgi_i_lockdays_crude))
+
+f_cgi_i_lockdays <- lm(as.formula(
+        paste0(
+          "cgi_i", "~",
+          "Lock_2"," +",
+          paste(COVARS_FIT, collapse = "+")
+          )
+        ),
+      df)
+    
+print(summary(f_cgi_i_lockdays))
+
+```
+
+- CGI-I ~ Lockdown (3-cat)
+```{r}
+f_cgi_i_lockdays_crude <- lm(as.formula(
+        paste0(
+          "cgi_i", "~",
+          "Lock_days_cat"
+          )
+        ),
+      df)
+print(summary(f_cgi_i_lockdays_crude))
+
+f_cgi_i_lockdays <- lm(as.formula(
+        paste0(
+          "cgi_i", "~",
+          "Lock_days_cat"," +",
+          paste(COVARS_FIT, collapse = "+")
+          )
+        ),
+      df)
+    
+print(summary(f_cgi_i_lockdays))
+
+```
+
+- X ~ lockdown (3-cat); mixed model
+```{r}
+get_tab_beforeafter <- function(df, set_outcome){
+  
+  main_mixed_eff_rst <- data.frame(
+  )
+  
+  sub_rst <- data.frame(
+    outcome = character(),
+    stringsAsFactors = F
+  )
+  
+  for (i in "Lock_days_cat"){
+    
+    for (j in set_outcome){
+      df_temp <- df %>%
+        filter(!is.na(.data[[j]]), !is.na(.data[[paste0(j,"_bl")]]))
+      
+      df_mixed_1_temp <- df_temp %>%
+        dplyr::select(id, COVARS, EXPOSURE_VAR, MEDIATION_VAR1, MEDIATION_VAR2, 
+                      MODIFIER_VAR, OUTCOME_VAR_BASELINE)
+      colnames(df_mixed_1_temp) <- gsub("_bl","",colnames(df_mixed_1_temp))
+  
+      df_mixed_2_temp <- df_temp %>%
+        dplyr::select(id, COVARS, EXPOSURE_VAR, MEDIATION_VAR1, MEDIATION_VAR2, 
+                      MODIFIER_VAR, OUTCOME_VAR_FOLLOWUP)
+      
+      df_mixed_temp <- bind_rows(df_mixed_1_temp, df_mixed_2_temp,.id = "timepoint")
+      df_mixed_temp$timepoint <- factor(as.numeric(df_mixed_temp$timepoint)-1)
+      
+      temp_f <- lmer(as.formula(
+          paste0(
+            j, "~",
+            i," * timepoint+",
+            paste(COVARS_FIT, collapse = "+"),"+",
+            "(1|id)"
+            )
+          ),
+        df_mixed_temp)
+      
+      temp_s <- summary(temp_f)
+      
+      temp_varno <- c(nrow(temp_s$coefficients)-1, nrow(temp_s$coefficients))
+      temp_pval <- pnorm(abs(temp_s$coefficient[temp_varno,"t value"]),lower.tail = FALSE)*2
+      
+      temp_sum <- df_temp %>%
+          group_by(.data[[i]]) %>%
+          summarise(m=mean(.data[[paste0(j,"_bl")]]),
+                    sd=sd(.data[[paste0(j,"_bl")]]),
+                    m2=mean(.data[[j]]),
+                    sd2=sd(.data[[j]]))
+      
+      temp_arr <- c()
+      for (k in 1:(length(temp_varno)+1)){
+        temp_arr <- c(temp_arr, unlist(temp_sum[k,]))
+      }
+      
+      for (k in 1:length(temp_varno)){
+        temp_arr <- c(temp_arr, temp_s$coefficients[temp_varno[k],], "P"=as.numeric(temp_pval[k]))
+      }
+      
+      main_mixed_eff_rst <- bind_rows(
+        main_mixed_eff_rst, temp_arr
+      )
+      
+      sub_rst <- bind_rows(
+        sub_rst, c(outcome = j)
+      )
+      
+    }
+  }
+  
+  main_mixed_eff_rst <- bind_cols(
+    sub_rst, main_mixed_eff_rst
+  )
+  
+  temp_fdr <- p.adjust(c(main_mixed_eff_rst$P...20, main_mixed_eff_rst$P...24), method = "fdr")
+  main_mixed_eff_rst$fdr1 <- temp_fdr[1:(length(temp_fdr)/2)]
+  main_mixed_eff_rst$fdr2 <- temp_fdr[(length(temp_fdr)/2+1):length(temp_fdr)]
+  
+  return(main_mixed_eff_rst)
+
+}
+```
+
+- SRS ~ Lockdown (3-cat)
+```{r}
+print(get_tab_beforeafter(df, set_outcome = OUTCOME_VAR_FOLLOWUP[startsWith(OUTCOME_VAR_FOLLOWUP, "srs")]))
+
+```
+
+- figure 1b
+```{r}
+ggpaired(rename(df, "Baseline" = srs_cog_bl,
+                "Follow-up"=srs_cog
+                ), 
+         "Baseline", "Follow-up", 
+         facet.by = "Lock_days_cat", 
+         panel.labs = list(Lock_days_cat=c("No lockdown","Short-term lockdown","Long-term lockdown")),
+         xlab = "Social Cognition (SRS)",
+         ylab = "Score"
+         )
+```
+
+
+- SDQ ~ Lockdown (3-cat)
+```{r}
+print("sdq")
+print(get_tab_beforeafter(df, set_outcome = OUTCOME_VAR_FOLLOWUP[startsWith(OUTCOME_VAR_FOLLOWUP, "sdq")]))
+```
+
+```{r}
+print("CBCL")
+print(get_tab_beforeafter(df, set_outcome = OUTCOME_VAR_FOLLOWUP[startsWith(OUTCOME_VAR_FOLLOWUP, "Z_HN")]))
+```
+
+```{r}
+print("CHRQ")
+print(get_tab_beforeafter(df, set_outcome = OUTCOME_VAR_FOLLOWUP[startsWith(OUTCOME_VAR_FOLLOWUP, "sleep")]))
+```
+
+- additional adjustment: school/behav/med influence
+```{r}
+for (i in c("school_3cat","behav_3cat", "med_3cat", "infect6")){
+  print(i)
+  f_cgi_i_inf1 <- lm(as.formula(
+    paste0(
+        "cgi_i", "~",
+        "Lock_days_cat"," +",
+        paste(c(COVARS_FIT, i), collapse = "+")
+    )
+),
+df)
+
+sum_temp <- summary(f_cgi_i_inf1)
+print(sum_temp)
+}
+
+```
+
+- effect modification
+```{r}
+centralize <- function(x,na.rm=TRUE) {
+    return(x-mean(x,na.rm=na.rm))
+  }
+
+get_tab_modification <- function(df, modifier, outcome = "cgi_i"){
+  df_centralize <- df %>%
+  filter(Lock_days_cat %in% c(
+    levels(df$Lock_days_cat)[1],
+    levels(df$Lock_days_cat)[3]
+  )) %>%
+  mutate_at(
+    vars(CONTINUOUS_VARS),
+    centralize
+  )
+  mod_eff_rst <- data.frame(
+)
+
+  sub_rst <- data.frame(
+    stringsAsFactors = F
+  )
+  
+  for (j in modifier){
+  
+    temp_f <- lm(
+      as.formula(
+        paste0(
+          "cgi_i ~ Lock_days_cat*",
+          j,  "+",
+          paste(COVARS, collapse = "+")
+          )
+        ),
+      df_centralize
+    )
+  
+    temp_s <- summary(temp_f)
+  
+    temp_varno <- nrow(temp_s$coefficients)
+  
+    temp_arr <- c()
+  
+    for (k in 1:length(temp_varno)){
+      temp_arr <- c(temp_arr, temp_s$coefficients[temp_varno[k],])
+    }
+  
+    mod_eff_rst <- bind_rows(
+      mod_eff_rst, temp_arr
+    )
+  
+    sub_rst <- bind_rows(
+      sub_rst, c(mod = j)
+    )
+  
+  }
+  
+  mod_eff_rst <- bind_cols(
+    sub_rst, mod_eff_rst
+  )
+  temp_fdr <- p.adjust(mod_eff_rst$`Pr(>|t|)`, method = "fdr")
+  mod_eff_rst$fdr <- temp_fdr
+  
+  return(mod_eff_rst)
+  
+}
+
+```
+
+- modifier: parental bfi
+```{r}
+print(get_tab_modification(df, modifier = MODIFIER_VAR[startsWith(MODIFIER_VAR, "BFI")]))
+```
+
+- figure 2
+```{r}
+fmt_pval <- function(p){
+  temp <- c()
+  for (i in p){
+    temp_p <- ifelse(is.character(i),i,
+           ifelse(i<0.001, "<0.001", paste0("=",sprintf("%0.3f", i))
+                  )
+           )
+    temp <- c(temp, temp_p)
+  }
+  return(temp)
+}
+
+LOCK_LABELS <- list(
+  "0_No_Lock" = "No lockdown",
+  "1_<35days" = "Lockdown, <35d",
+  "2_>=35days" = "Lockdown, ≥35d"
+)
+
+
+for (i in c(4)){
+  
+  temp_mod <- paste0("BFI_", LETTERS[1:5])[i]
+  temp_exp <- "Lock_days_cat"
+  temp_out <- "cgi_i"
+  
+  temp_text <- ""
+  
+  lev_exp <- levels(df[[temp_exp]])
+  
+  temp_syn <- data.frame(stringsAsFactors = F)
+  
+  temp_nonlinear <- lm(
+      as.formula(
+        paste0(
+          temp_out, "~",
+          temp_mod, "*",temp_exp,"+",
+          paste(COVARS, collapse = "+")
+          )
+        ),
+      df
+    )
+  
+  temp_sumf <- summary(temp_nonlinear)
+  temp_num <- nrow(temp_sumf$coefficients)
+  nonlinear_pval <- temp_sumf$coefficients[c(temp_num-1, temp_num),4]
+  nonlinear_pval <- fmt_pval(nonlinear_pval)
+  
+  for (k in 1:length(lev_exp)){
+    
+    temp_f <- Glm(
+      as.formula(
+        paste0(
+          temp_out, "~",
+          temp_mod, "+",
+          paste(COVARS, collapse = "+")
+          )
+        ),family = "gaussian",
+      df, subset = df[[temp_exp]]==lev_exp[k]
+    )
+    
+    temp_s <- Predict(temp_f)
+    temp_s_mod <- temp_s[startsWith(rownames(temp_s), temp_mod), ]
+    temp_s_mod$mod <- lev_exp[k]
+    
+    temp_syn <- bind_rows(
+      temp_syn,
+      temp_s_mod, 
+    )
+    
+    temp_sumf <- get_model_stats(temp_f)
+    temp_pval <- temp_sumf$coefs$`Pr(>|Z|)`[2]
+    temp_pval <- fmt_pval(temp_pval)
+    
+    temp_betastat <- temp_f$coefficients[2]
+    
+    temp_text <- paste0(
+      temp_text,
+      LOCK_LABELS[lev_exp[k]][[1]],", β=", sprintf("%0.3f",temp_betastat),", P", 
+      temp_pval,
+      ifelse(k==1,"", paste0(", P interaction", 
+                             nonlinear_pval[k-1]
+                             )
+             ),
+      "\n"
+    )
+    
+  }
+  
+  temp_syn$mod <- as.factor(temp_syn$mod)
+  
+  # png(filename = paste0(
+  #   temp_mod,"_",temp_out,".png"
+  # ))
+  
+  print(
+      ggplot()+
+    geom_point(aes(x = df[[temp_mod]],
+                   y = df[[temp_out]],
+                   color = df[[temp_exp]]),
+               data = df)+
+    geom_line(
+      aes(x=temp_syn[[temp_mod]],
+          y=temp_syn$yhat,
+          color = temp_syn$mod)
+    )+
+    geom_ribbon(
+      aes(x=temp_syn[[temp_mod]],
+          ymin = temp_syn$lower,
+          ymax=temp_syn$upper,
+          fill = temp_syn$mod),
+          alpha = .1
+    )+
+    geom_text(
+      aes(x = -Inf, y = Inf),
+      hjust = 0, vjust = 1,
+      label=temp_text
+      )+
+    xlab(temp_mod)+
+    ylab(temp_out)+
+    theme_minimal()+
+    scale_color_discrete(name = "Lockdown", labels = LOCK_LABELS)+
+    scale_fill_discrete(name = "Lockdown", labels = LOCK_LABELS)+
+      ylab("CGI improvement")+
+      xlab("BFI agreeableness")
+    )
+  
+  # dev.off()
+}
+```
+
+- modifier: CD-RISK-10
+```{r}
+print(get_tab_modification(df, modifier = MODIFIER_VAR[startsWith(MODIFIER_VAR, "Resil")]))
+```
+
+- modifier: CD-RISK-10
+```{r}
+print(get_tab_modification(df, modifier = MODIFIER_VAR[startsWith(MODIFIER_VAR, "Fami")]))
+```
+
+- modifier: ERQ
+```{r}
+print(get_tab_modification(df, modifier = MODIFIER_VAR[startsWith(MODIFIER_VAR, "Emo")]))
+```
+
+- intercorrelation: bfi and others
+```{r}
+for (i in c("Resil_TS", "Fami_adapt", "Fami_cohes", "Emo_A", "Emo_B")){
+  temp_f <- lm(
+    as.formula(
+      paste0(
+        i,"~BFI_D+",
+        paste(c("Educa_2","Income_2"), collapse = "+")
+        )
+      ),
+    df
+  )
+  temp_s <- summary(temp_f)
+  
+  print(i)
+  print(temp_s$coefficients[2,])
+}
+
+for (i in c("Stress_total", "log_Anti_T", "Deps_TS")){
+  temp_f <- lm(
+    as.formula(
+      paste0(
+        i,"~BFI_D+",
+        paste(c("Educa_2","Income_2"), collapse = "+")
+        )
+      ),
+    filter(df, Lock_days_cat=="2_>=35days")
+  )
+  temp_s <- summary(temp_f)
+  
+  print(i)
+  print(temp_s$coefficients[2,])
+}
+```
+- additional adjustment for family-related variables
+```{r}
+for (i in c("Resil_TS", "Fami_adapt", "Fami_cohes", "Emo_A", "Emo_B",
+            "Stress_total")){
+  temp_f <- lm(
+    as.formula(
+      paste0(
+        "cgi_i~Lock_days_cat*BFI_D+",
+        i, "+",
+        paste(COVARS, collapse = "+")
+        )
+      ),
+    df
+  )
+  temp_s <- summary(temp_f)
+  temp_pval <- temp_s$coefficients[nrow(temp_s$coefficients),4]
+  print(temp_s$coefficients[nrow(temp_s$coefficients),])
+}
+```
+
+
