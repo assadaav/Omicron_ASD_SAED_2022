@@ -397,7 +397,7 @@ get_tab_beforeafter <- function(df, set_outcome){
       temp_s <- summary(temp_f)
       
       temp_varno <- c(nrow(temp_s$coefficients)-1, nrow(temp_s$coefficients))
-      temp_pval <- pnorm(abs(temp_s$coefficient[temp_varno,"t value"]),lower.tail = FALSE)*2
+      temp_pval <- t2P(temp_s$coefficient[temp_varno,"t value"]), df.residual(temp_f))
       
       temp_sum <- df_temp %>%
           group_by(.data[[i]]) %>%
